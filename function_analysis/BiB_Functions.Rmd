@@ -1,0 +1,285 @@
+---
+title: "From broad annotations to specific functions"
+author: "Prebiomics"
+date: "2026-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Functional annotations with Humann3
+
+Dataset : Raymond F et al. 2016, ISMEJ
+
+"The initial state of the human gut microbiome determines its reshaping by antibiotics" 
+
+Stool samples gathered before antibiotic exposure, at the end of the treatment and 3 months later from 24 particpants.
+
+Toolbox : Humann3 (Beghini et al. 2020, Elife)
+
+Access  : curatedMetagenomicData (Pasolli et al. 2017, Nat Methods)
+
+```{r libraries, echo = FALSE, warning=FALSE, message=FALSE}
+library(curatedMetagenomicData)
+library(dplyr)
+library(ggplot2)
+library(maaslin3)
+library(reshape2)
+library(vegan)
+# Always set a seed so your analysis is repeatable.
+set.seed(1234)
+```
+
+<br/>
+
+#### 1. Loading Humann3 pathway data
+
+Using cMD instead of raw SRA downloads is the path of least resistance: the data comes pre-processed (Humann3 relative abundances) with metadata already attached. 
+
+```{r cmd, echo=TRUE, warning=FALSE, message=FALSE}
+raymond <- curatedMetagenomicData(
+    "RaymondF_2016.pathway_abundance",
+    dryrun = FALSE,
+    counts = FALSE,        # FALSE = relative abundances (0-100 scale here)
+    rownames = "short"     # short species names, easier to read in plots
+)[[1]]
+
+# We now have a TreeSummarizedExperiment. Inspect it.
+raymond
+# - assay():       pathway x samples matrix of relative abundances
+# - colData():     per-sample metadata (age, gender, BMI, disease, stage, ...)
+
+meta  <- as.data.frame(colData(raymond))    # samples x metadata
+meta$study_condition[!meta$subject_id %in% meta$subject_id[which(meta$study_condition == "control" & meta$days_from_first_collection == 7)]] <- "cephalosporins"
+feat <- assay(raymond)
+```
+
+Let's look at how Humann3 provides functional relative abundances; functions are provided as a singular value and also with the contribution of each taxon to a particular function:
+
+```{r stratified_not, echo=TRUE, warning=FALSE, message=FALSE}
+feat[grep("PWY-6737:", rownames(feat))[1:10],1]
+```
+
+Also, it's good to know what fraction of the reads are not being captured at the pathway level. This information is available by looking at the UNMAPPED and/or UNINTEGRATED rows. 
+
+```{r unintegrated, echo=TRUE, warning=FALSE, message=FALSE}
+head(feat[grep("UNMAPPED|UNINTEGRATED$", rownames(feat)),1:5])
+```
+
+We can also use pathway relative abundances to look at changes in beta diversity:
+
+```{r beta_div, echo=TRUE, warning=FALSE, message=FALSE}
+feat <- feat[grep("\\|", rownames(feat), invert = T),]
+feat <- feat * 100
+
+dst <- vegan::vegdist(t(feat), method = "robust.aitchison")
+dst <- as.matrix(dst)
+colnames(dst) <- colnames(feat)
+rownames(dst) <- colnames(feat)
+dst <- dst/max(dst)
+
+dists_control <- data.frame(Dist_0_7=diag(dst[rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 7)]]), 
+           Dist_0_90=diag(dst[rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 90)]])
+)
+dists_control$Group <- "Control"
+
+dists_atb <- data.frame(Dist_0_7=diag(dst[rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 7)]]),
+                        Dist_0_90=diag(dst[rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 90)]]))
+dists_atb$Group <- "Antibiotics"
+
+dsts_groups <- reshape2::melt(rbind(dists_control, dists_atb))
+ggplot(dsts_groups, aes(variable, value, fill = Group)) + geom_boxplot() + ylab("Robust Aitchison distance") + scale_x_discrete(labels = c("Day 0 - Day 7", "Day 0 - Day 90")) +  theme_bw() + theme(axis.title.x = element_blank()) +
+  ggtitle("Pathway abundance beta diversity")
+wilcox.test(dsts_groups$value[dsts_groups$Group == "Control" & dsts_groups$variable == "Dist_0_7"],
+            dsts_groups$value[dsts_groups$Group == "Antibiotics" & dsts_groups$variable == "Dist_0_7"])
+wilcox.test(dsts_groups$value[dsts_groups$Group == "Control" & dsts_groups$variable == "Dist_0_90"],
+            dsts_groups$value[dsts_groups$Group == "Antibiotics" & dsts_groups$variable == "Dist_0_90"])
+```
+
+We see that distances between day 0 and day 7 are significantly greater (p = 0.005) in individuals that took antibiotics compared to those who did not. This difference is no longer significant comparing day 0 and day 90 (p = 0.06), 
+
+<br/>
+
+#### 2. Loading Humann3 gene family data
+
+The lowest level of functional information available from Humann3 relates to UniRef90 gene family relative abundances. Let's retrieve them using cMD:
+```{r cmd_gf, echo=TRUE, warning=FALSE, message=FALSE}
+raymond_gf <- curatedMetagenomicData(
+    "RaymondF_2016.gene_families",
+    dryrun = FALSE,
+    counts = FALSE,        # FALSE = relative abundances (0-100 scale here)
+    rownames = "short"    # short species names, easier to read in plots
+)[[1]]
+
+# We now have a TreeSummarizedExperiment. Inspect it.
+raymond_gf
+# - assay():       gene families x samples matrix of relative abundances
+# - colData():     per-sample metadata (age, gender, BMI, disease, stage, ...)
+
+meta  <- as.data.frame(colData(raymond_gf))    # samples x metadata
+meta$study_condition[!meta$subject_id %in% meta$subject_id[which(meta$study_condition == "control" & meta$days_from_first_collection == 7)]] <- "cephalosporins"
+feat <- assay(raymond_gf)
+```
+
+We see now we have ~4.7million features. 
+
+Now, what fraction of the reads are not captured at the gene family level?
+```{r unmapped_gf, echo=TRUE, warning=FALSE, message=FALSE}
+head(feat[grep("UNMAPPED", rownames(feat)),1:10])
+```
+
+<br/>
+
+#### 3. Mapping gene families to CAZy enzymes
+
+Now we will regroup our Humann3 gene family output to another specific set of functions: Carbohydrate-Active enZymes. This can be done using Humann3's humann_regroup_table function and a map between the gene families and the target set of specific functions:
+
+```console
+humann_regroup_table --input RaymondF_2016_genefamilies.txt \
+    --custom map_cazy_uniref90.txt \
+    --output RaymondF_2016_cazy_humann.tsv
+```
+
+Now, what fraction of the reads are not captured by mapping to CAZy enzymes?
+
+```{r cazy_map, echo=TRUE, warning=FALSE, message=FALSE}
+cazy <- read.table("RaymondF_2016_cazy_humann.tsv", header = T, sep = "\t", row.names = 1)
+head(colSums(cazy[grep("UNMAPPED|UNGROUPED$", rownames(cazy)),1:10]))
+```
+
+What does beta diversity look like using CAZy enzyme abundances?
+
+```{r beta_div_cazy, echo=TRUE, warning=FALSE, message=FALSE}
+cazy_unstratified <- cazy[grep("\\|", rownames(cazy), invert = T),]
+cazy_unstratified <- cazy_unstratified * 100
+
+dst <- vegan::vegdist(t(cazy_unstratified), method = "robust.aitchison")
+dst <- as.matrix(dst)
+colnames(dst) <- colnames(cazy)
+rownames(dst) <- colnames(cazy)
+dst <- dst/max(dst)
+
+dists_control <- data.frame(Dist_0_7=diag(dst[rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 7)]]), 
+           Dist_0_90=diag(dst[rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "control" & meta$days_from_first_collection == 90)]])
+)
+dists_control$Group <- "Control"
+
+dists_atb <- data.frame(Dist_0_7=diag(dst[rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 7)]]),
+                        Dist_0_90=diag(dst[rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 0)],rownames(meta)[which(meta$study_condition == "cephalosporins" & meta$days_from_first_collection == 90)]]))
+dists_atb$Group <- "Antibiotics"
+
+dsts_groups <- reshape2::melt(rbind(dists_control, dists_atb))
+ggplot(dsts_groups, aes(variable, value, fill = Group)) + geom_boxplot() + ylab("Robust Aitchison distance") + scale_x_discrete(labels = c("Day 0 - Day 7", "Day 0 - Day 90")) +  theme_bw() + theme(axis.title.x = element_blank()) +
+  ggtitle("CAZy abundance beta diversity")
+
+wilcox.test(dsts_groups$value[dsts_groups$Group == "Control" & dsts_groups$variable == "Dist_0_7"],
+            dsts_groups$value[dsts_groups$Group == "Antibiotics" & dsts_groups$variable == "Dist_0_7"])
+wilcox.test(dsts_groups$value[dsts_groups$Group == "Control" & dsts_groups$variable == "Dist_0_90"],
+            dsts_groups$value[dsts_groups$Group == "Antibiotics" & dsts_groups$variable == "Dist_0_90"])
+```
+
+<br/>
+
+#### 4. Which CAZy family abundances are affected and recover after antibiotic use?
+
+Using the unstratified CAZy relative abundance output from the regrouped Humann3 UniRef90 gene families to identify which CAZys change relative to day 0 and don't change at day 90. We will use Maaslin3 to do so:
+
+```{r cazy_recovery, echo=TRUE, warning=FALSE, message=FALSE, results = "hide"}
+cazy_input <- t(cazy_unstratified)        # now samples x CAZy families
+
+# Metadata, restricted to treated subjects
+meta_treated <- meta[meta$study_condition == "cephalosporins", ]
+meta_treated$days_from_first_collection <- factor(meta_treated$days_from_first_collection,
+                                  levels = c("0", "7", "90"))   # day 0 = reference
+
+# Align the abundance table to the metadata samples
+cazy_input <- cazy_input[rownames(meta_treated), ]
+fit <- maaslin3(
+    input_data     = cazy_input,
+    input_metadata = meta_treated,
+    output         = "maaslin3_cazy_recovery",
+    small_random_effects = TRUE,
+    formula        = ~ days_from_first_collection + age + gender + (1 | subject_id),   # timepoint fixed, subject random
+    normalization  = "TSS",         # total-sum scaling; CAZy abundances are compositional
+    transform      = "LOG",         # log transform after normalization
+    reference      = c("days_from_first_collection,0")   # force day 0 as reference
+)
+```
+![](maaslin3_cazy_recovery/figures/summary_plot.png)
+
+<br/>
+
+We see that GH112 and GH113 were depleted by the antibiotic at day 7 and were no longer significantly depleted by day 90. These degrade different substrates (host glycans vs plant mannans). 
+
+```{r cazy_recovery_match, echo=TRUE, warning=FALSE, message=FALSE}
+res <- read.table("maaslin3_cazy_recovery/significant_results.tsv",
+                  header = TRUE, sep = "\t")
+res_all <- read.table("maaslin3_cazy_recovery/all_results.tsv",
+                  header = TRUE, sep = "\t")
+
+res_all <- res_all[res_all$feature %in% unique(res$feature[res$value == "7"]),]
+
+res_all_day7 <- res_all %>% select(feature, metadata, value, coef, qval_joint, model) %>% filter(value == 7)
+res_all_day90 <- res_all %>% select(feature, metadata, value, coef, qval_joint, model) %>% filter(value == 90)
+
+tbl <- left_join(res_all_day7, res_all_day90, by = c("feature", "model", "metadata")) %>% arrange(feature) %>% filter(feature == "GH112" | feature == "GH113") %>% filter(model == "abundance")
+
+as_tibble(tbl)
+```
+
+<br/>
+
+![](maaslin3_cazy_recovery/figures/association_plots/days_from_first_collection/linear/days_from_first_collection_GH112_linear.png)
+![](maaslin3_cazy_recovery/figures/association_plots/days_from_first_collection/linear/days_from_first_collection_GH113_linear.png)
+
+<br/>
+
+#### 5. Looking at species carrying GH112 and GH113
+
+Now let's further investigate what is happening to these CAZy enzymes by looking at the stratified output. We want to know whether this change in abundance is due to some contributing species being lost or to an overall decrease in all microbes carrying these enzymes. 
+
+```{r cazy_recovery_match_gh112_gh113, echo=TRUE, warning=FALSE, message=FALSE, results = "hide"}
+cazy_unstratified <- cazy[grep("\\|", rownames(cazy), invert = T),]
+cazy_stratified <- cazy[grep("\\||UNMAPPED", rownames(cazy), invert = F),]
+cazy_targeted <- cazy[grep("GH112\\||GH113\\|", rownames(cazy), invert = F),]
+
+other_taxa <-  colSums(cazy_stratified) - colSums(cazy_targeted)
+cazy_targeted <- rbind(cazy_targeted, other_taxa)
+rownames(cazy_targeted)[16] <- "Other_taxa_functions"
+cazy_targeted <- cazy_targeted * 100 
+cazy_targeted <- t(cazy_targeted)
+
+# Align the abundance table to the metadata samples
+cazy_targeted <- cazy_targeted[rownames(meta_treated), ]
+fit <- maaslin3(
+    input_data     = cazy_targeted,
+    input_metadata = meta_treated,
+    output         = "maaslin3_cazy_recovery_stratified",
+    small_random_effects = TRUE,
+    formula        = ~ days_from_first_collection + age + gender + (1 | subject_id),   # timepoint fixed, subject random
+    normalization  = "TSS",         # total-sum scaling; CAZy abundances are compositional
+    transform      = "LOG",         # log transform after normalization
+    reference      = c("days_from_first_collection,0")   # force day 0 as reference
+)
+```
+
+<br/>
+
+Overview of the stratified results:
+
+![](maaslin3_cazy_recovery_stratified/figures/summary_plot.png)
+
+<br/>
+
+For GH112 we see a clear pattern of loss at day 7, with GH112 coming from *Eubacterium rectale*, *Ruminococcus torques*, *Roseburia inulinovorans* and *Roseburia faecis* being depleted compared to days 0 and 90. 
+
+
+![](maaslin3_cazy_recovery_stratified/figures/association_plots/days_from_first_collection/logistic/days_from_first_collection_GH112.g__Blautia.s__Ruminococcus_torques_logistic.png)
+
+![](maaslin3_cazy_recovery_stratified/figures/association_plots/days_from_first_collection/logistic/days_from_first_collection_GH112.g__Lachnospiraceae_unclassified.s__Eubacterium_rectale_logistic.png)
+
+![](maaslin3_cazy_recovery_stratified/figures/association_plots/days_from_first_collection/logistic/days_from_first_collection_GH112.g__Roseburia.s__Roseburia_faecis_logistic.png)
+
+![](maaslin3_cazy_recovery_stratified/figures/association_plots/days_from_first_collection/logistic/days_from_first_collection_GH112.g__Roseburia.s__Roseburia_inulinivorans_logistic.png)

@@ -1,0 +1,444 @@
+---
+title: "BiB - Supervised Machine Learning"
+author: "Prebiomics"
+date: "2026-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Supervised machine learning on microbiome data with SIAMCAT
+
+Dataset : Yachida et al. 2019, Nat Med
+
+"Metagenomic and metabolomic analyses reveal distinct stage-specific phenotypes of the gut microbiota in CRC" 
+
+Japanese cohort, shotgun metagenomics, ~600 subjects.
+
+Toolbox : SIAMCAT (Wirbel et al. 2021, Genome Biol)
+
+Access  : curatedMetagenomicData (Pasolli et al. 2017, Nat Methods)
+
+This pipeline is not really "about SIAMCAT". It's about what a careful supervised-learning workflow looks like on microbiome data:
+
+* filter for sparsity
+* check confounders BEFORE modelling
+* respect compositionality in normalisation
+* regularise for high-dimensionality
+* correct cross-validation including hyperparameter search and model evaluation (and report the distribution)
+* validate externally before believing the number
+
+**SIAMCAT's value is that it has put guard rails to enforce a careful path.**
+
+```{r libraries, echo = FALSE, warning=FALSE, message=FALSE}
+library(SIAMCAT)
+library(curatedMetagenomicData)
+library(dplyr)
+library(pROC)
+# Reproducibility: ML pipelines involve randomness (CV folds, model init).
+# Always set a seed so your analysis is repeatable.
+set.seed(1234)
+```
+
+<br/>
+
+#### 1. Loading the data
+
+Using cMD instead of raw SRA downloads is the path of least resistance: the data comes pre-processed (MetaPhlAn relative abundances) with metadata already attached. 
+
+```{r cmd, echo=TRUE, warning=FALSE, message=FALSE}
+yachida <- curatedMetagenomicData(
+    "YachidaS_2019.relative_abundance",
+    dryrun = FALSE,
+    counts = FALSE,        # FALSE = relative abundances (0-100 scale here)
+    rownames = "short"     # short species names, easier to read in plots
+)[[1]]
+
+# We now have a TreeSummarizedExperiment. Inspect it.
+yachida
+# - assay():       species x samples matrix of relative abundances
+# - colData():     per-sample metadata (age, gender, BMI, disease, stage, ...)
+
+# Pull the two pieces SIAMCAT needs: a feature matrix and a metadata table.
+meta  <- as.data.frame(colData(yachida))    # samples x metadata
+feat <- read.table("YachidaS_2019_profile.tsv", header = T, sep = "\t", check.names = F, row.names = 1)
+feat <- feat[grep("t__",  rownames(feat)),]
+rownames(feat) <- unlist(lapply(rownames(feat), function(x) { paste0(unlist(strsplit(x, "\\|"))[c(2,6,7,8)], collapse = "|") }))
+
+# SIAMCAT expects relative abundances on a 0-1 scale; cMD gives 0-100.
+feat  <- feat / 100
+```
+
+Quick sanity checks - always look at your data before modelling.
+
+How many species x samples?
+```{r sanity_check1, echo=TRUE}
+dim(feat)                                   
+```
+
+Each sample should sum to ~1
+```{r sanity_check2, echo=TRUE}
+colSums(feat) |> head()                     
+```
+
+What groups are present?
+```{r sanity_check3, echo=TRUE}
+table(meta$study_condition)                 
+```
+
+<br/>
+
+#### 2. Define what it is you're predicting  
+
+If it's binary or multi-class labels -> Classification
+
+If it's a value -> Regression 
+
+Label encoding is a study design decision. 
+
+The Yachida cohort spans healthy -> adenoma -> multiple CRC stages. We have to decide what we're predicting. 
+
+Here: a clean binary task. We compare invasive CRC (stage I and above) against controls. We exclude stage 0 / carcinoma in situ because its microbiome closely resembles healthy controls — note this makes the task easier and less clinically representative, since early detection is where a biomarker would matter most.
+
+```{r label_building, echo=TRUE}
+# Keep only clear cases and clear controls.
+keep_samples_ctr <- rownames(meta)[meta$study_condition == "control"]
+keep_samples_crc <- rownames(meta)[meta$study_condition == "CRC" & meta$ajcc != "0"]
+meta <- meta[c(keep_samples_ctr, keep_samples_crc), ]
+feat <- feat[, rownames(meta)]              # keep feature matrix in sync!
+
+# Confirm the two-group structure.
+table(meta$study_condition)
+```
+
+<br/>
+
+#### 3.Build the SIAMCAT object
+
+Features + label + metadata in one place
+
+The siamcat object is an S4 container. Each downstream function **adds** a slot to it (filtered features, normalised features, the data split, the model, predictions, evaluation).
+
+```{r siamcat_obj, echo=TRUE}
+sc.obj <- siamcat(
+    feat  = feat,
+    meta  = meta,
+    label = "study_condition",
+    case  = "CRC"                           # which level is the "positive" class
+)
+
+show(sc.obj)
+```
+
+<br/>
+
+#### 4. Filter Features
+
+Most species are absent (zero) in most samples. Rare features add noise  and multiple-testing burden with little signal. Prevalence filtering keeps only species seen in at least X% of samples.
+
+```{r siamcat_filter, echo=TRUE}
+sc.obj <- filter.features(
+    sc.obj,
+    filter.method = "prevalence",
+    cutoff        = 0.05                     # keep species present in >=5% samples
+)
+
+# How many features remain? (Look before vs after.)
+nrow(get.filt_feat.matrix(sc.obj))
+```
+
+<br/>
+
+#### 5. Check confounders
+
+Before training anything, ask: does any metadata variable separate the groups as well as (or better than) the microbiome? 
+
+If cases and controls differ in library size, age, or BMI, a "microbiome signature" may be an artefact of that variable.
+
+```{r siamcat_confounders, echo=TRUE}
+check.confounders(
+    sc.obj,
+    fn.plot = "confounders_yachida.pdf",
+    meta.in = c("age", "gender", "BMI", "number_reads", "smoking", "alcohol_numeric"),                        
+    feature.type = "filtered"
+)
+```
+  ![](confounders_yachida.pdf){width=100% height=400}
+
+Have a look and see:
+
+* Does library size differ between CRC and control? (depth artefact risk)
+* Are age / BMI / gender imbalanced across groups? (biological confounding)
+
+<br/>
+
+#### 6. Normalization
+
+Normalization interacts with both compositionality and downstream model behaviour. Two sensible options include:
+
+* "log.std"  : log-transform + standardise (a common default)
+* "log.clr"  : centred log-ratio -> the compositionality-aware choice
+* "rank.unit": rank-based -> robust to batch, used in CRC meta-analyses
+
+We use rank.unit because rank-based normalisation transfers across cohorts with different sequencing protocols, which matters for the external validation in Section 12. 
+
+```{r siamcat_normalize, echo=TRUE}
+sc.obj <- normalize.features(
+    sc.obj,
+    norm.method = "rank.unit",
+    feature.type = "filtered"
+)
+```
+
+<br/>
+
+#### 7. Splitting the data
+
+Data splitting is the practice of partitioning a dataset into separate portions for training and evaluation, so that a model's performance is measured on data it has never seen — without this separation, a model evaluated on its own training data will look deceptively good because it can simply memorise rather than generalise. 
+
+The simplest approach is a single holdout split (e.g. 70/30), where 70% of samples train the model and the remaining 30% test it; this is easy to explain but wastes a chunk of data for training and gives only one noisy performance estimate that depends heavily on which samples happened to land in the test set. 
+
+K-fold cross-validation addresses this by dividing the data into k equal parts, training on k−1 and testing on the held-out part, then rotating so every sample is tested exactly once — yielding a more reliable estimate that uses all the data, often repeated several times to capture the variability across different random splits. 
+
+Cross-validation is generally preferable for the small sample sizes typical of microbiome studies, where wasting 30% of the data on a single split is costly and a single estimate is too unstable to trust.
+
+5-fold CV: split into 5 parts; train on 4, test on 1; rotate so every sample is tested exactly once. 
+
+Repeat the whole thing 10x with different random folds to get a **distribution** of performance, not one number.
+
+```{r siamcat_split, echo=TRUE}
+sc.obj <- create.data.split(
+    sc.obj,
+    num.folds    = 5,                       # 5-fold...
+    num.resample = 10,                      # ...repeated 10 times
+    stratify     = TRUE                     # preserve case/control ratio in each fold
+)
+```
+
+<br/>
+
+#### 8. Training a model 
+
+Choose a model. A benchmark designed to evaluate methods for predicting host phenotypes from gut metagenomic data with different  machine learning algorithms can be viewed at:
+
+https://lampp.yassourlab.com/
+
+Here we have opted for a LASSO (L1-regularised logistic regression) model, which fits a standard logistic regression but adds a penalty proportional to the sum of the absolute values of the coefficients, which shrinks the model's weights toward zero (L1 penalty). 
+
+This drives many coefficients exactly to zero rather than merely shrinking them, performing automatic feature selection and yielding a sparse model that uses only a subset of the input features. 
+
+The strength of the penalty is controlled by a tuning parameter (called lambda), which trades off model fit against sparsity — making it well suited to high-dimensional settings like microbiome data where there are far more features than samples.
+
+Other machine learning algorithms include: "randomForest", "enet" (elastic net), "ridge", "lasso_ll". 
+
+```{r siamcat_train, echo=TRUE}
+sc.obj <- train.model(
+    sc.obj,
+    method = "lasso", measure = "classif.auc", param.set = list(type.measure = "auc") 
+)
+
+# Inspect the trained models (one per CV fold/resample).
+models <- models(sc.obj) 
+length(models)                              # = num.folds * num.resample
+```
+
+SIAMCAT tunes the LASSO penalty parameter lambda using **nested cross-validation**, which separates hyperparameter selection from performance estimation to avoid optimistic bias. The outer loop holds out test folds purely for evaluation, while within each outer training fold an inner cross-validation loop trials a grid of lambda values and selects the one giving best predictive performance. That chosen lambda is then used to train the final model on the full outer training fold, which is evaluated on the untouched outer test fold — so the data used to pick lambda is never the same data used to judge the model.
+
+Note the number of non-zero features at each lambda at the top of the figure; this is LASSO doing feature selection (sparse on the left, dense on the right).
+
+```{r siamcat_hyper, echo=TRUE}
+# Pick the very first model (Repetition 1, Fold 1)
+first_model <- models(sc.obj)[[1]]
+
+# Plot the inner CV curve
+# This shows the 99 points. The y-axis is AUC, the x-axis is Log(Lambda)
+plot(first_model$model$native_model)
+
+best_training_aucs <- sapply(models, function(m) {
+  max(m$model$native_model$cvm)
+})
+```
+
+<br/>
+
+#### 9. Using the model to predict unseen data
+
+SIAMCAT applies each fold's model to its held-out test samples (the 1 left out fold), so every sample gets an out-of-fold prediction. 
+
+```{r siamcat_predict, echo=TRUE}
+sc.obj <- make.predictions(sc.obj)
+```
+
+For each sample in the test set, the model outputs a probability between 0 and 1 representing its confidence that the sample is CRC. Values closer to 1 indicate the model predicts CRC; values closer to 0 indicate it predicts control.
+
+```{r siamcat_predict_matrix, echo=TRUE}
+head(pred_matrix(sc.obj))
+```
+
+<br/>
+
+#### 10. Evaluate the model's performance
+
+One of the standard ways to evaluate a model's performance is through the ROC (Receiver Operating Characteristic) curve, which plots a classifier's true positive rate (sensitivity) against its false positive rate (1 − specificity) across every possible probability threshold. The AUC (Area Under the Curve) collapses this entire curve into a single number between 0 and 1: the probability that the model assigns a higher score to a randomly chosen case than to a randomly chosen control. Because it integrates over all thresholds, AUC measures a model's ranking ability independent of any particular cutoff — 0.5 indicates no better than chance, 1.0 indicates perfect separation — which makes it useful for comparing models.
+
+```{r siamcat_evaluate, echo=TRUE, warning = FALSE, message = FALSE}
+sc.obj <- evaluate.predictions(sc.obj)
+
+eval_data <- eval_data(sc.obj)
+cat("Mean AUROC:", round(eval_data$auroc, 3), "\n")
+
+model.evaluation.plot(
+    sc.obj,
+    fn.plot = "evaluation_yachida.pdf"
+)
+```
+![](evaluation_yachida.pdf){width=100% height=400}
+
+The inner-loop AUC is optimistically biased because lambda was tuned on that data; the outer-loop AUC is the honest estimate. A small gap would indicate limited overfitting; a large gap would warn of it.
+
+```{r siamcat_evaluate_overfit, echo=TRUE}
+boxplot(list(Inner_Loop_Training = best_training_aucs, Outer_Loop_Testing = sc.obj@eval_data$auroc.all),
+        main = "Nested CV: Inner vs Outer Loop Performance",
+        ylab = "AUC", col = c("lightblue", "lightcoral"))
+```
+
+Since a model outputs probabilities, to use other metrics to evaluate a model's performance, we first need to choose a probability cutoff which converts the probability into a binary prediction. 
+
+The Youden index (sensitivity + specificity − 1) is one common criterion for this choice: it identifies the threshold that maximises the combined ability to correctly detect cases and correctly rule out controls, corresponding geometrically to the point on the ROC curve furthest from the diagonal. Its key limitation is that it weights false positives and false negatives equally, which is often inappropriate in clinical settings — for cancer screening, for example, you may deliberately choose a lower threshold to prioritise sensitivity, accepting more false positives to avoid missing true cases.
+
+```{r siamcat_youden, echo=TRUE}
+roc.obj <- eval_data(sc.obj)$roc
+opt <- coords(roc.obj, x = "best", best.method = "youden",
+              ret = "threshold")
+opt.thresh <- as.numeric(opt$threshold)
+print(paste0("Youden index optimization cutoff: ", round(opt.thresh, digits = 3)))
+```
+
+Note the optimal threshold sits essentially at 0.5 here — close to the default — though there's no guarantee it will; it depends on the score distribution and the cost trade-off Youden assumes.
+
+A confusion matrix cross-tabulates predicted against true labels, splitting performance into four cells: true positives, true negatives, false positives, and false negatives. It shows how a model errs, not just how often. Standard metrics (sensitivity, specificity, precision) derive from its four cells.
+
+```{r siamcat_confusion_mtx, echo=TRUE}
+# Build confusion matrix at that threshold (using pooled predictions, one resample col)
+probs <- pred_matrix(sc.obj)[, 1]
+true.aligned <- label(sc.obj)$label[rownames(pred_matrix(sc.obj))]
+pred.class  <- ifelse(probs > opt.thresh, "CRC", "control")
+true.class  <- ifelse(true.aligned > 0, "CRC", "control")  # confirm via $info
+table(Predicted = pred.class, True = true.class)
+```
+
+<br/>
+
+#### 11. Interpret the model
+
+The model interpretation plot shows:
+
+* which features the model selected and their weights
+* how robust each feature is across CV folds
+* how the selected features distribute across cases vs controls
+
+```{r siamcat_interpret, echo=TRUE, warning = FALSE, message = FALSE}
+model.interpretation.plot(
+    sc.obj,
+    consens.thres = 0.5,                    # show features selected in >=50% models
+    fn.plot = "interpretation_yachida.pdf"
+)
+```
+![](interpretation_yachida.pdf){width=100% height=400}
+
+<br/>
+
+#### 12. External validation
+
+Cross-study transfer is the real test of a biomarker.
+
+External validation in SIAMCAT means applying the entire trained ensemble (50 models) to a new cohort and seeing whether the averaged prediction holds up. The test is whether the whole system, averaged, transfers to a held-out cohort.
+
+Load a second CRC metagenomic cohort, build a siamcat object with the **same** features, normalise with **frozen** parameters from the training data, then apply the trained model and evaluate.
+
+Example of a second cohort: (German CRC cohort, Zeller et al. 2014)
+
+```{r siamcat_validate, echo=TRUE, warning = FALSE, message = FALSE}
+zeller <- curatedMetagenomicData("ZellerG_2014.relative_abundance",
+                                  dryrun = FALSE, counts = FALSE,
+                                  rownames = "short")[[1]]
+
+
+feat.test <- read.table("ZellerG_2014_profile.tsv", header = T, sep = "\t", check.names = F, row.names = 1)
+feat.test <- feat.test[grep("t__",  rownames(feat.test)),]
+rownames(feat.test) <- unlist(lapply(rownames(feat.test), function(x) { paste0(unlist(strsplit(x, "\\|"))[c(2,6,7,8)], collapse = "|") }))
+
+feat.test <- feat.test / 100
+meta.test <- as.data.frame(colData(zeller))
+
+# Keep only CRC vs control in the test cohort too.
+keep.test  <- meta.test$study_condition %in% c("control", "CRC")
+meta.test  <- meta.test[keep.test, ]
+feat.test  <- feat.test[, rownames(meta.test)]
+
+sc.obj.test <- siamcat(feat = feat.test, meta = meta.test,
+                       label = "study_condition", case = "CRC")
+
+feat.test <- get.orig_feat.matrix(sc.obj.test)
+missing   <- setdiff(norm_params(sc.obj)$retained.feat, rownames(feat.test))
+
+# Add missing features as zero rows
+zero.rows <- matrix(0, nrow = length(missing), ncol = ncol(feat.test),
+                    dimnames = list(missing, colnames(feat.test)))
+feat.test.augmented <- rbind(feat.test, zero.rows)
+
+# Rebuild the holdout siamcat object with the augmented matrix
+sc.obj.test <- siamcat(feat = feat.test.augmented, meta = meta.test,
+                       label = "study_condition", case = "CRC")
+
+# normalise the holdout with the TRAINING set's frozen parameters,
+# # and align features to those the model was trained on.
+sc.obj.test <- normalize.features(
+     sc.obj.test,
+     norm.param  = norm_params(sc.obj),     # frozen params from training data
+     feature.type = "original",
+     verbose = 2
+)
+
+# # Apply the model trained on Yachida to the Zeller samples.
+# # make.predictions takes the TRAINED object + the holdout object.
+sc.obj.test <- make.predictions(
+     siamcat          = sc.obj,             # trained on Yachida
+     siamcat.holdout  = sc.obj.test,        # external Zeller cohort
+     normalize.holdout = FALSE              # we already normalised with frozen params
+)
+
+sc.obj.test <- evaluate.predictions(sc.obj.test)
+
+# Compare within-study vs cross-study AUC on one plot (pass a NAMED list):
+model.evaluation.plot(
+     "Yachida (CV)"      = sc.obj,
+     "Zeller (external)" = sc.obj.test,
+     fn.plot = "external_validation.pdf" 
+)
+
+eval_data <- eval_data(sc.obj.test)
+cat("Mean AUROC:", round(eval_data$auroc, 3), "\n")
+```
+![](external_validation.pdf){width=100% height=400}
+
+Compare model performances across different slices of data. Performance *usually* degrades, and the gap between internal and external is the real test — here it happens to hold up well, which is a sign the signal transfers. 
+
+```{r siamcat_validate_across, echo=TRUE, warning = FALSE, message = FALSE}
+pred.mat.zeller <- pred_matrix(sc.obj.test)
+
+true.zeller <- label(sc.obj.test)$label[rownames(pred.mat.zeller)]
+
+# One AUROC per model column
+auc.per.model <- apply(pred.mat.zeller, 2, function(probs) {
+    as.numeric(pROC::auc(response = true.zeller,
+                         predictor = probs,
+                         quiet = TRUE))
+})
+
+boxplot(list(Inner_Loop_Training = best_training_aucs, Outer_Loop_Testing = sc.obj@eval_data$auroc.all, External_Testing = auc.per.model),
+        main = "Model performance",
+        ylab = "AUC", col = c("lightblue", "lightcoral", "purple"))
+```
