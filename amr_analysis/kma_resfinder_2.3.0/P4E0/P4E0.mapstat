@@ -1,0 +1,20 @@
+## method	KMA
+## version	1.4.9
+## database	resfinder_2.3.0
+## fragmentCount	79444767
+## date	2026-06-22
+## command	kma -ipe "/shares/CIBIO-Storage/CM/scratch/prebiomics/tools/scarico_rubinetto/kma/RaymondF_2016/P4E0/P4E0_R1.fastq" "/shares/CIBIO-Storage/CM/scratch/prebiomics/tools/scarico_rubinetto/kma/RaymondF_2016/P4E0/P4E0_R2.fastq" -t_db /shares/CIBIO-Storage/CM/scratch/prebiomics/data/databases/kma_databases/resfinder_2.3.0 -t 2 -ef -1t1 -ID 90 -md 5.0 -o "/shares/CIBIO-Storage/CM/scratch/prebiomics/data/projects/RaymondF_2016/kma_resfinder_2.3.0/P4E0/P4E0" 
+# refSequence	readCount	fragmentCount	mapScoreSum	refCoveredPositions	refConsensusSum	bpTotal	depthVariance	nucHighDepthVariance	depthMax	snpSum	insertSum	deletionSum	readCountAln	fragmentCountAln
+cfxA3_1_AF472622	604	458	43244	966	900	59238	3647.835642	0	188	5203	187	14	598	455
+cfxA6_1_GQ342996	20813	11467	1797636	996	991	1920027	140143.908238	0	2846	29077	13048	3981	20546	11262
+erm(B)_12_U18931	346	197	30865	736	732	32312	140.139989	0	62	343	154	58	346	197
+erm(F)_4_M62487	285	163	25906	776	775	26982	101.079549	0	54	228	116	60	285	163
+erm(G)_1_M15332	49	32	4494	688	685	4606	12.035011	0	16	34	6	0	49	32
+msr(D)_2_AF274302	80	51	6990	1391	1370	7576	14.365598	0	13	180	16	5	80	51
+tet(40)_1_FJ158002	295	163	27345	1221	1218	28416	495.254858	0	89	282	91	26	295	163
+tet(40)_2_AM419751	1527	861	137302	1221	1218	142815	1422.039767	0	229	1327	602	171	1524	860
+tet(O)_2_M20925	1140	650	106591	1864	1829	110058	1143.818271	0	128	909	312	68	1138	650
+tet(O)_3_Y07780	502	277	48435	1847	1843	50042	404.119921	0	86	427	142	34	502	277
+tet(Q)_1_L33696	5424	3137	499749	1926	1923	528486	4445.400064	0	421	7825	2102	571	5421	3134
+tet(Q)_2_X58717	2480	1519	230073	1926	1915	243811	1982.747736	0	240	3839	922	252	2480	1519
+tet(W)_5_AJ427422	1156	653	103951	1920	1918	106758	358.831032	0	105	753	275	47	1154	651
