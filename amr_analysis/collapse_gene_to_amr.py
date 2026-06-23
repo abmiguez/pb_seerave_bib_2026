@@ -1,5 +1,3 @@
-#!/mnt/Prebiomics_Data/tools/anaconda3/envs/prebiomics/bin/python
-
 import pandas as pd
 import argparse as ap
 import os
