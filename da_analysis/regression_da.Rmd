@@ -1,0 +1,602 @@
+---
+title: "regression_da_seerave_bib"
+output: html_document
+date: "2026-06-18"
+---
+
+
+```{r libraries, echo = FALSE, warning=FALSE, message=FALSE}
+library(emmeans)
+library(curatedMetagenomicData)
+library(tidyverse)
+library(broom)
+# Reproducibility: ML pipelines involve randomness (CV folds, model init).
+# Always set a seed so your analysis is repeatable.
+set.seed(1234)
+```
+
+```{r cmd, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+yachida <- curatedMetagenomicData(
+    "YachidaS_2019.relative_abundance",
+    dryrun = FALSE,
+    counts = FALSE,        # FALSE = relative abundances (0-100 scale here)
+    rownames = "short"     # short species names, easier to read in plots
+)[[1]]
+
+# We now have a TreeSummarizedExperiment. Inspect it.
+yachida
+# - assay():       species x samples matrix of relative abundances
+# - colData():     per-sample metadata (age, gender, BMI, disease, stage, ...)
+
+# Pull the two pieces SIAMCAT needs: a feature matrix and a metadata table.
+feat  <- as.matrix(assay(yachida))          # features (species) x samples
+
+feat <- t(feat) # samples on rows and features on columns
+
+meta <- 
+  as.data.frame(colData(yachida)) %>%  # samples x metadata
+  filter(disease %in% c("CRC", "healthy"),
+         disease_location %in% c(NA, "left_colon","rectum","right_colon")) %>% 
+  mutate(disease_location2=factor(
+    case_when(
+      disease == "healthy" ~ "healthy",
+      TRUE ~ disease_location
+      )
+    )
+  ) %>%
+  select(subject_id, disease, disease_location, ajcc, brinkman_index, alcohol_numeric, age, gender, BMI) %>% 
+  drop_na(brinkman_index, alcohol_numeric, age, gender, BMI)
+
+# subset feature table
+feat <- feat[rownames(feat) %in% rownames(meta),]
+```
+
+```{r, DA1: Case vs Control}
+# Case vs Control adjusting for global covariates (i.e. brinkman_index, alcohol_numeric, age, gender, BMI)
+# Conditional analysis -> CRC vs healthy, holding the other covariates constant
+
+##########---------------------------------------------------------------------------------
+
+# prevalence filtering (10%) including both cases and controls
+min_prev <- 0.1
+prev <- colMeans(feat > 0, na.rm = TRUE)
+feat_da1 <- feat[, prev >= min_prev, drop = FALSE]
+
+# 0 imputation (also normalize/closes composition)
+feat_imp_da1 <- as.matrix(zCompositions::cmultRepl(feat_da1, method="CZM", z.delete = F))
+# centered log-ratio transformation
+feat_case_vs_ctrl <- compositions::clr(feat_imp_da1)
+
+##########---------------------------------------------------------------------------------
+
+# Prepare data.frame
+
+meta_case_vs_ctrl <- 
+  meta %>% 
+  mutate(disease=factor(disease, levels=c("healthy","CRC")),
+         age_c=scale(age, scale=F, center=T),
+         bmi_c=scale(BMI, scale=F, center=T),
+         sex=factor(gender, levels=c("female","male"))) %>% 
+  rownames_to_column("sampleid") %>% 
+  left_join(
+    (data.frame(feat_case_vs_ctrl, check.names=F) %>% rownames_to_column("sampleid"))
+  ) 
+
+##########---------------------------------------------------------------------------------
+
+# Regression on a categorical variable is the same as computing a difference in means
+
+meta_case_vs_ctrl %>%
+  select(disease, `Fusobacterium nucleatum`) %>% 
+  group_by(disease) %>% 
+  summarise(mean_=mean(`Fusobacterium nucleatum`))
+
+# t-test
+t.test(meta_case_vs_ctrl$`Fusobacterium nucleatum`~meta_case_vs_ctrl$disease)
+
+# linear regression without additional covariates
+m1 <- lm(`Fusobacterium nucleatum` ~ disease, meta_case_vs_ctrl)
+broom::tidy(m1)
+
+coef_df <- tidy(m1)
+
+b0 <- coef_df$estimate[coef_df$term == "(Intercept)"]
+b1 <- coef_df$estimate[coef_df$term == "diseaseCRC"]
+
+mean_healthy <- b0
+mean_crc     <- b0 + b1
+
+augment(m1) %>% 
+  ggplot(aes(y = `Fusobacterium nucleatum`, x = disease)) +
+  geom_point(width = 0.15, alpha = 0.6) +
+  geom_hline(yintercept = mean_healthy, color = "blue") +
+  geom_hline(yintercept = mean_crc, color = "red") +
+  annotate(
+    "text",
+    x = c(1, 2),
+    y = c(mean_healthy, mean_crc),
+    hjust = c(1.1, -0.1),
+    label = c(
+      str_glue("bar(y)[healthy] == {format(mean_healthy, digits = 2, nsmall = 1)}"),
+      str_glue("bar(y)[CRC] == {format(mean_crc, digits = 2, nsmall = 1)}")
+    ),
+    parse = TRUE,
+    size = 5
+  ) +
+  annotate(
+    "text",
+    x = 1.2,
+    y = 4,
+    label = str_glue(
+      "y = {format(b0, digits = 2, nsmall = 2)} {ifelse(b1 >= 0, '+', '-')} {format(abs(b1), digits = 2, nsmall = 2)} * X"
+    ),
+    hjust = 0,
+    size = 5
+  ) +
+  theme_bw() +
+  labs(
+    title = "Regression on a categorical variable is the same as computing a difference in means",
+    x = NULL,
+    y = "CLR abundance"
+  )
+
+##########---------------------------------------------------------------------------------
+
+# Fit regression model 
+
+lm_case_vs_ctrl_ls <- lm_obj_case_vs_ctrl_ls <- vector("list", ncol(feat_case_vs_ctrl))
+names(lm_case_vs_ctrl_ls) <- names(lm_obj_case_vs_ctrl_ls) <- colnames(feat_case_vs_ctrl)
+
+for(f in colnames(feat_case_vs_ctrl)) {
+
+  form <- as.formula(
+    paste0(
+      "`", f, "` ~ disease + brinkman_index + alcohol_numeric + age_c + bmi_c + sex"
+    )
+  )
+
+  m1 <- lm(form, data = meta_case_vs_ctrl)
+  lm_obj_case_vs_ctrl_ls[[f]] <- m1
+  m1_df <- data.frame(coef(summary(m1)))
+  colnames(m1_df)[4] <- "p_val"
+
+  lm_case_vs_ctrl_ls[[f]] <- m1_df
+}
+
+##########---------------------------------------------------------------------------------
+
+### Checking a few assumptions
+
+## Residual vs fitted values 
+# Is the model systematically wrong for certain predicted values?
+# You want to see a random cloud around zero
+# If you see a curve, then the relationship may not be linear
+# If you see a funnel, then the variance is changing across fitted values
+# Both can make estimates and p-values less reliable
+
+## QQ plot
+# Are the residuals approximately normally distributed?
+# You want to see points close to the diagonal line, this means that residual distribution is reasonably close to normal
+# We want the residuals to follow the diagonal line reasonably well
+
+# The residuals-vs-fitted plot checks whether the model is systematically wrong, while the QQ plot checks whether the residuals follow the distribution assumed by the model.
+
+plot(lm_obj_case_vs_ctrl_ls$`Fusobacterium nucleatum`, which=1) # Residual vs fitted values 
+
+plot(lm_obj_case_vs_ctrl_ls$`Fusobacterium nucleatum`, which=2) # QQ plot
+
+# The Fusobacterium nucleatum model does not appear to systematically over- or under-predict for certain fitted values, suggesting the linearity assumption is reasonably satisfied. There is some evidence that the residual variance changes slightly across fitted values, but the deviation is not severe.
+
+# The residuals are not perfectly normally distributed. In particular, there are several observations with unusually large positive residuals, leading to a heavy upper tail.
+
+# ---> The residual diagnostics suggest that the linear model provides a reasonable, though not perfect, description of the data. Mild departures from the assumptions are expected in microbiome studies and are often tolerated when sample sizes are large.
+
+##########---------------------------------------------------------------------------------
+
+# Interpretation of coefficients
+
+lm_case_vs_ctrl_ls$`Fusobacterium nucleatum`
+
+# Intercept (b0): -1.5930629385 --> Expected abundance for a healthy female with average age and BMI and Brinkman=0, alcohol_numeric=0
+# diseaseCRC (b1): 0.4388421321 --> Comparing a CRC patient and a healthy individual with the same age, BMI, smoking exposure, alcohol consumption and sex, the expected CLR abundance of Fusobacterium nucleatum is ~ 0.4388 units higher in the CRC patient. 
+
+# Relative to the average microbial abundance profile (represented by the sample geometric mean), Fusobacterium nucleatum tends to occupy a larger proportion of the community in CRC patients than in healthy controls.
+
+# A coefficient of 0.4388421321 corresponds to approximately a exp(0.4388421321) or a 1.55-fold higher abundance relative to the sample geometric mean.
+
+##########---------------------------------------------------------------------------------
+
+# Prepare output
+
+res_disease <- imap_dfr(
+  lm_case_vs_ctrl_ls,
+  ~{
+    if(!"diseaseCRC" %in% rownames(.x)) return(NULL)
+
+    est <- .x["diseaseCRC", "Estimate"]
+    se  <- .x["diseaseCRC", "Std. Error"]
+
+    tibble(
+     taxon    = .y,
+      estimate = .x["diseaseCRC", "Estimate"],
+      se       = .x["diseaseCRC", "Std..Error"],
+      ci_low   = est - 1.96 * se,
+      ci_high  = est + 1.96 * se,
+      p_val    = .x["diseaseCRC", "p_val"]
+    )
+  }
+) %>%
+  mutate(
+    p_fdr = p.adjust(p_val, method = "fdr")
+  )
+
+##########---------------------------------------------------------------------------------
+
+# Plot results
+
+res_disease %>% 
+  filter(p_fdr < 0.05) %>%
+  arrange(estimate) %>%
+  mutate(taxon = factor(taxon, levels = taxon)) %>% 
+  
+  ggplot(aes(x = estimate, y = taxon)) +
+  geom_vline(xintercept = 0,
+             linetype = 2,
+             colour = "grey50") +
+  geom_errorbar(
+    aes(xmin = ci_low,
+        xmax = ci_high),
+    height = 0.2
+  ) +
+  geom_point(size = 3) +
+  theme_bw() +
+  labs(
+    x = "CRC - Healthy (CLR abundance)",
+    y = NULL
+  )
+
+```
+
+```{r, Case-Control using other approaches}
+
+library(ANCOMBC)
+
+## add comparison with other DA methods 
+
+```
+
+```{r, DA2: Case specific analysis: disease location (marginal effects)}
+
+# Now we move from coefficients to contrasts, for example left_colon vs right_colon
+# Estimated marginal means are predictions from the fitted model combined into interpretable contrasts.
+
+##########---------------------------------------------------------------------------------
+
+# Prepare data.frame
+
+meta_disease_loc <- 
+  meta %>% 
+  filter(disease=="CRC") %>% 
+  mutate(disease_location=factor(disease_location, levels=c("rectum","left_colon","right_colon")),
+         stage=factor(ajcc),
+         stage_bin = case_when(
+           stage %in% c("0", "i", "ii") ~ "early-stage",
+           stage %in% c("iii", "iv") ~ "advanced-stage"
+           ),
+         stage_bin=factor(stage_bin, levels=c("early-stage", "advanced-stage")),
+         age_c=scale(age, scale=F, center=T),
+         bmi_c=scale(BMI, scale=F, center=T),
+         sex=factor(gender, levels=c("female","male"))) %>% 
+  rownames_to_column("sampleid") 
+
+##########---------------------------------------------------------------------------------
+
+# As we only analyze cases here, we re-do the prevalence filtering on cases only 
+
+min_prev <- 0.1
+prev <- colMeans(feat[rownames(feat) %in% meta_disease_loc$sampleid,] > 0, na.rm = TRUE)
+feat_da2 <- feat[rownames(feat) %in% meta_disease_loc$sampleid, prev >= min_prev, drop = FALSE]
+
+# 0 imputation (also normalize/closes composition)
+
+feat_imp_da2 <- as.matrix(zCompositions::cmultRepl(feat_da2, method="CZM", z.delete = F))
+# Centered log-ratio transformation
+
+feat_disease_loc <- compositions::clr(feat_imp_da2)
+
+##########---------------------------------------------------------------------------------
+
+# Concatenate feature table to metadata
+
+meta_disease_loc <-
+  meta_disease_loc %>% 
+  left_join(
+    (data.frame(feat_disease_loc, check.names=F) %>% rownames_to_column("sampleid"))
+  ) 
+
+##########---------------------------------------------------------------------------------
+
+# Fit regression model 
+
+lm_disease_loc_ls <- vector("list", ncol(feat_disease_loc))
+names(lm_disease_loc_ls) <- colnames(feat_disease_loc)
+
+for(f in colnames(feat_disease_loc)) {
+
+  form <- as.formula(
+    paste0(
+      "`", f, "` ~ disease_location + stage + brinkman_index + alcohol_numeric + age_c + bmi_c + sex"
+    )
+  )
+
+  lm_disease_loc_ls[[f]] <- lm(form, data = meta_disease_loc)
+
+}
+
+##########---------------------------------------------------------------------------------
+
+# Construct contrast matrix
+
+# A contrast is a weighted comparison of means. The weights must sum to zero so that the contrast represents a difference rather than an overall level.
+
+contrast_disease_loc <- 
+    list("rectum vs left_colon"=c(1,-1,0),
+         "rectum vs right_colon"=c(1,0,-1),
+         "left_colon vs right_colon"=c(0,1,-1))
+
+emm_disease_location <- emm_diff_disease_location <- vector("list", ncol(feat_disease_loc))
+names(emm_disease_location) <- names(emm_diff_disease_location) <- colnames(feat_disease_loc)
+
+for(f in colnames(feat_disease_loc)) {
+  
+  emm_disease_location[[f]] <- emmeans(lm_disease_loc_ls[[f]], "disease_location")
+  emm_diff_disease_location[[f]] <- data.frame(emmeans::contrast(emm_disease_location[[f]], contrast_disease_loc))
+
+}
+
+##########---------------------------------------------------------------------------------
+
+# Inspect the marginal means for one example taxon - Fusobacterium nucleatum 
+
+emm_disease_location$`Fusobacterium nucleatum`
+plot(emm_disease_location$`Fusobacterium nucleatum`)
+
+# Inspect the difference in marginal means between disease_location for one example taxon - Fusobacterium nucleatum 
+
+emm_diff_disease_location$`Fusobacterium nucleatum`
+
+##########---------------------------------------------------------------------------------
+
+# Prepare output
+
+res_disease_loc <- imap_dfr(
+  emm_diff_disease_location,
+  ~ mutate(.x, 
+           taxon = .y, 
+           ci_low  = estimate - 1.96 * SE,
+           ci_high = estimate + 1.96 * SE)) %>% 
+  group_by(contrast) %>%
+  mutate(p_fdr = p.adjust(p.value, method = "fdr"))
+
+res_disease_loc %>%
+  arrange(p_fdr)
+
+res_disease_loc %>% 
+  filter(p_fdr < 0.05) # test 0.1 - no taxon is DA between locations
+
+# Because no taxa are sig different between locations, we plot the taxa that are DA between CRC vs healthy
+
+plot_taxa <- 
+  res_disease %>% 
+  filter(p_fdr < 0.05,
+         estimate>0) %>%
+  arrange(desc(estimate)) %>% 
+  pull(taxon) %>% 
+  as.character()
+
+##########---------------------------------------------------------------------------------
+
+# Plot results 
+
+# Contrast: Left vs right colon 
+res_disease_loc %>%
+  filter(
+    taxon %in% plot_taxa,
+    contrast == "left_colon vs right_colon"
+  ) %>%
+  
+  ggplot(aes(x = estimate, y = taxon)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "Left colon - Right colon contrast (CLR units)",
+    y = NULL
+  )
+
+# Contrast: Rectum vs left colon
+res_disease_loc %>%
+  filter(
+    taxon %in% plot_taxa,
+    contrast == "rectum vs left_colon"
+  ) %>%
+  
+  ggplot(aes(x = estimate, y = taxon)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "Rectum - Left colon contrast (CLR units)",
+    y = NULL
+  )
+
+# Contrast: Rectum vs right colon 
+res_disease_loc %>%
+  filter(
+    taxon %in% plot_taxa,
+    contrast == "rectum vs right_colon"
+  ) %>%
+  
+  ggplot(aes(x = estimate, y = taxon)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "Rectum - Right colon contrast (CLR units)",
+    y = NULL
+  )
+
+```
+
+```{r, DA3: Case specific analysis: early vs advanced-stage (marginal effects)}
+
+# Marginal comparison early-stage - advanced-stage averaging over disease location, sex, age, BMI, smoking and alcohol consumption 
+
+# Fit regression model 
+
+lm_stage_bin <- vector("list", ncol(feat_disease_loc))
+names(lm_stage_bin) <- colnames(feat_disease_loc)
+
+for(f in colnames(feat_disease_loc)) {
+
+  form <- as.formula(
+    paste0(
+      "`", f, "` ~ stage_bin + disease_location + brinkman_index + alcohol_numeric + age_c + bmi_c + sex"
+    )
+  )
+  
+  lm_stage_bin[[f]] <- lm(form, data = meta_disease_loc)
+
+}
+
+##########---------------------------------------------------------------------------------
+
+# Prepare contrast 
+# A contrast is a weighted comparison of means. The weights must sum to zero so that the contrast represents a difference rather than an overall level.
+
+emm_stage_bin <- emm_diff_stage_bin <- vector("list", ncol(feat_disease_loc))
+names(emm_stage_bin) <- names(emm_diff_stage_bin) <- colnames(feat_disease_loc)
+
+for(f in colnames(feat_disease_loc)) {
+  
+  emm_stage_bin[[f]] <- emmeans(lm_stage_bin[[f]], ~ stage_bin)
+  emm_diff_stage_bin[[f]] <- data.frame(emmeans::contrast(emm_stage_bin[[f]], "pairwise"))
+  
+}
+  
+res_stage_bin <- imap_dfr(
+  emm_diff_stage_bin,
+  ~ mutate(.x, 
+           taxon = .y, 
+           ci_low  = estimate - 1.96 * SE,
+           ci_high = estimate + 1.96 * SE)
+) %>% 
+  mutate(p_fdr = p.adjust(p.value, method = "fdr"))
+  
+
+res_stage_bin %>% 
+  filter(p_fdr<0.1) %>% # 3 taxa are DA at FDR<10% and 2 taxa at FDR<5%
+  
+  ggplot(aes(x = estimate, y = taxon)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.2) +
+  geom_point(size = 3) +
+  theme_classic() +
+  labs(
+    x = "Early-stage - Advanced-stage contrast (CLR units)",
+    y = NULL
+  )
+```
+
+```{r, DA4: Case specific analysis: early vs advanced-stage (marginal effects)}
+
+# Without interaction: stage_bin + disease_location
+# assumes that the stage effect is identical in rectum, left colon and right colon.
+
+# With interaction: stage_bin * disease_location, the stage effect can differ by location.
+
+##########---------------------------------------------------------------------------------
+
+# Fit regression model with interaction between stage_bin and disease_location
+
+lm_interaction <- vector("list", ncol(feat_disease_loc))
+names(lm_interaction) <- colnames(feat_disease_loc)
+
+for(f in colnames(feat_disease_loc)) {
+
+  form <- as.formula(
+    paste0(
+      "`", f, "` ~ stage_bin * disease_location + brinkman_index + alcohol_numeric + age_c + bmi_c + sex"
+    )
+  )
+  
+  lm_interaction[[f]] <- lm(form, data = meta_disease_loc)
+
+}
+
+emm_stage_by_location <- emm_diff_stage_by_location <- vector("list", ncol(feat_disease_loc))
+names(emm_stage_by_location) <- names(emm_diff_stage_by_location) <- colnames(feat_disease_loc)
+
+for(f in colnames(feat_disease_loc)) {
+  
+  emm_stage_by_location[[f]] <- emmeans(lm_interaction[[f]], ~ stage_bin | disease_location)
+  emm_diff_stage_by_location[[f]] <- data.frame(emmeans::contrast(emm_stage_by_location[[f]], method = "pairwise", by = "disease_location"))
+
+}
+
+##########---------------------------------------------------------------------------------
+
+# The interaction plot is easier to understand than the coefficients
+
+emmip(lm_interaction$`Fusobacterium nucleatum`, ~ stage_bin ~ disease_location, CIs = T)
+
+##########---------------------------------------------------------------------------------
+
+# Prepare output 
+
+res_stage_by_location <- imap_dfr(
+  emm_diff_stage_by_location,
+  ~ mutate(.x, 
+           taxon = .y,
+           ci_low  = estimate - 1.96 * SE,
+           ci_high = estimate + 1.96 * SE)
+) %>%
+  group_by(disease_location) %>%
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) %>%
+  ungroup()
+
+##########---------------------------------------------------------------------------------
+
+# Plot results
+
+res_stage_by_location %>% 
+  filter(p_fdr < 0.10) %>%
+  arrange(disease_location, estimate) %>%
+  mutate(
+    taxon = factor(taxon, levels = unique(taxon))
+  ) %>% 
+ggplot(aes(x = estimate, y = taxon)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+  geom_errorbarh(
+    aes(xmin = ci_low, xmax = ci_high),
+    height = 0.2
+  ) +
+  geom_point(size = 3) +
+  facet_wrap(~ disease_location, scales = "free_y") +
+  theme_classic() +
+  labs(
+    x = "Advanced-stage - early-stage contrast (CLR units)",
+    y = NULL
+  )
+
+# Interaction plot
+
+emmip(lm_interaction$`Gemella morbillorum`, ~ stage_bin ~ disease_location, CIs = T)
+emmip(lm_interaction$`Dialister pneumosintes`, ~ stage_bin ~ disease_location, CIs = T)
+
+```
+
+
