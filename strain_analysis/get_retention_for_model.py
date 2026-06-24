@@ -5,7 +5,6 @@ metadata = pd.read_csv('RaymondF_2016_metadata.tsv', sep='\t', index_col=1)
 strain_identity_threshold = 0.0001
 comparison = '0-7'
 
-retention = pd.DataFrame()
 for sgb in os.listdir('RaymondF_2016/'):
     print(sgb)
     mutation_rates = f'distances/{sgb}.tsv'
@@ -19,16 +18,4 @@ for sgb in os.listdir('RaymondF_2016/'):
     same_individual_distances['Distance'] = same_individual_distances['Distance'].astype(float)
     same_individual_distances['Retention'] = same_individual_distances['Distance'] < strain_identity_threshold
     same_individual_distances['Retention'] = same_individual_distances['Retention'].astype(int)
-    tmp = pd.DataFrame(same_individual_distances[same_individual_distances['Comparison'] == comparison].groupby('Group')['Retention'].sum()/same_individual_distances[same_individual_distances['Comparison'] == comparison].groupby('Group')['Retention'].count())
-    tmp.columns=[sgb]
-    if len(tmp.dropna())==2:
-        retention = pd.concat([retention, tmp], axis=1)
-retention = (
-    retention.reset_index()
-    .melt(
-        id_vars='Group',
-        var_name='SGB',
-        value_name='Retention'
-    )
-)
-retention.to_csv('retention.tsv', sep='\t')
+    same_individual_distances.to_csv(f'retention/{sgb}.tsv', sep='\t')
